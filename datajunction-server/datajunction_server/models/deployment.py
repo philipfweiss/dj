@@ -1,4 +1,6 @@
+import hashlib
 import json
+import math
 from collections.abc import Iterable
 from enum import Enum, IntEnum
 from typing import Annotated, Any, ClassVar, Literal
@@ -66,6 +68,31 @@ class ChangeTier(IntEnum):
     NONE = 0
     MINOR = 10
     MAJOR = 20
+
+
+ChangeTierName = Literal["none", "minor", "major"]
+
+
+def change_tier_name(tier: ChangeTier) -> ChangeTierName:
+    """Return the stable API representation of a change tier."""
+    names: dict[ChangeTier, ChangeTierName] = {
+        ChangeTier.NONE: "none",
+        ChangeTier.MINOR: "minor",
+        ChangeTier.MAJOR: "major",
+    }
+    return names[tier]
+
+
+class SemanticFingerprint(BaseModel):
+    """A versioned digest of a node's semantic definition."""
+
+    algorithm: Literal["sha256"] = "sha256"
+    version: int = 1
+    digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]+$",
+    )
 
 
 def fold_change_tiers(tiers: Iterable[ChangeTier]) -> ChangeTier:
@@ -473,10 +500,13 @@ class DimensionLinkSpec(BaseModel):
     role: str | None = None
     namespace: str | None = Field(default=None, exclude=True)
 
+    def _comparison_key(self) -> tuple[Any, ...]:
+        return (self.type, self.role)
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, DimensionLinkSpec):
             return False  # pragma: no cover
-        return self.type == other.type and self.role == other.role
+        return self._comparison_key() == other._comparison_key()
 
 
 class DimensionJoinLinkSpec(DimensionLinkSpec):
@@ -517,31 +547,23 @@ class DimensionJoinLinkSpec(DimensionLinkSpec):
         )
 
     def __hash__(self) -> int:
-        return hash(
-            (
-                self.type,
-                self.role,
-                self.rendered_dimension_node,
-                self.join_type,
-                self.join_cardinality,
-                self.rendered_join_on,
-                self.node_column,
-                self.default_value,
-            ),
+        return hash(self._comparison_key())
+
+    def _comparison_key(self) -> tuple[Any, ...]:
+        return (
+            *super()._comparison_key(),
+            self.rendered_dimension_node,
+            self.join_type,
+            self.join_cardinality,
+            self.rendered_join_on,
+            self.node_column,
+            self.default_value,
         )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, DimensionJoinLinkSpec):
             return False  # pragma: no cover
-        return (
-            super().__eq__(other)
-            and self.rendered_dimension_node == other.rendered_dimension_node
-            and self.join_type == other.join_type
-            and self.join_cardinality == other.join_cardinality
-            and self.rendered_join_on == other.rendered_join_on
-            and self.node_column == other.node_column
-            and self.default_value == other.default_value
-        )
+        return self._comparison_key() == other._comparison_key()
 
 
 class DimensionReferenceLinkSpec(DimensionLinkSpec):
@@ -570,25 +592,20 @@ class DimensionReferenceLinkSpec(DimensionLinkSpec):
         return self.dimension.rsplit(".", 1)[-1]
 
     def __hash__(self) -> int:
-        return hash(
-            (
-                self.type,
-                self.role,
-                self.rendered_dimension_node,
-                self.dimension_attribute,
-                self.node_column,
-            ),
+        return hash(self._comparison_key())
+
+    def _comparison_key(self) -> tuple[Any, ...]:
+        return (
+            *super()._comparison_key(),
+            self.rendered_dimension_node,
+            self.dimension_attribute,
+            self.node_column,
         )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, DimensionReferenceLinkSpec):
             return False
-        return (
-            super().__eq__(other)
-            and self.rendered_dimension_node == other.rendered_dimension_node
-            and self.dimension_attribute == other.dimension_attribute
-            and self.node_column == other.node_column
-        )
+        return self._comparison_key() == other._comparison_key()
 
 
 def render_prefixes(parameterized_string: str, prefix: str | None = None) -> str:
@@ -715,6 +732,12 @@ class NodeSpec(NamespacedSpec):
         prefix = f"{self.namespace}{SEPARATOR}" if self.namespace else ""
         rendered_json = json.dumps(raw).replace("${prefix}", prefix)
         return self.__class__.model_validate_json(rendered_json)
+
+    def semantic_fingerprint(self) -> SemanticFingerprint:
+        """Return the version 1 fingerprint of this node's semantic definition."""
+        payload = _semantic_fingerprint_payload(self)
+        digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+        return SemanticFingerprint(digest=digest)
 
     def diff(self, other: "NodeSpec") -> list[str]:
         """
@@ -864,21 +887,15 @@ class LinkableNodeSpec(NodeSpec):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, LinkableNodeSpec):
             return False  # pragma: no cover
-        dimension_links_equal = sorted(
-            self.dimension_links or [],
-            key=lambda link: (link.rendered_dimension_node, link.role or ""),
-        ) == sorted(
-            other.dimension_links or [],
-            key=lambda link: (link.rendered_dimension_node, link.role or ""),
-        )
         return (
             super().__eq__(other)
             and eq_columns(
                 self.columns,
                 other.columns,
-                compare_types=True if self.node_type == NodeType.SOURCE else False,
+                compare_types=self.node_type == NodeType.SOURCE,
             )
-            and dimension_links_equal
+            and _canonical_dimension_links(self.dimension_links)
+            == _canonical_dimension_links(other.dimension_links)
             and set(self.primary_key or []) == set(other.primary_key or [])
         )
 
@@ -1298,21 +1315,166 @@ class CubeSpec(NodeSpec):
 
         # Compare only partition config for user-specified columns.
         # Cube element columns (types, order, attributes) are auto-derived and ignored.
-        incoming_partitions = {
-            col.name: col.partition for col in self.rendered_columns if col.partition
-        }
-        existing_partitions = {
-            col.name: col.partition
-            for col in (other.rendered_columns or [])
-            if col.partition
-        }
-        return incoming_partitions == existing_partitions
+        return _canonical_cube_columns(
+            self.rendered_columns,
+        ) == _canonical_cube_columns(other.rendered_columns)
 
 
 NodeUnion = Annotated[
     SourceSpec | TransformSpec | DimensionSpec | MetricSpec | CubeSpec,
     Field(discriminator="node_type"),
 ]
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize a fingerprint value using the version 1 JSON contract."""
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _canonical_value(value: Any) -> Any:
+    """Convert supported values to deterministic JSON-compatible values."""
+    if isinstance(value, Enum):
+        return _canonical_value(value.value)
+    if isinstance(value, BaseModel):
+        return _canonical_value(value.model_dump(mode="python"))
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("Semantic fingerprint mappings require string keys")
+        return {key: _canonical_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("Semantic fingerprint values must be finite")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(
+        f"Unsupported semantic fingerprint value: {type(value).__name__}",
+    )
+
+
+def _sorted_canonical_values(values: Iterable[Any], *, unique: bool = False) -> list:
+    canonical = [_canonical_value(value) for value in values]
+    if unique:
+        by_json = {_canonical_json(value): value for value in canonical}
+        return [by_json[key] for key in sorted(by_json)]
+    return sorted(canonical, key=_canonical_json)
+
+
+def _normalized_column(
+    column: ColumnSpec | None,
+    name: str,
+    fallback_type: str | None,
+    compare_types: bool,
+) -> ColumnSpec:
+    normalized = (
+        column.model_copy()
+        if column
+        else ColumnSpec(
+            name=name,
+            display_name=labelize(name),
+            type=fallback_type or "",
+            attributes=[],
+        )
+    )
+    normalized.display_name = normalized.display_name or labelize(name)
+    normalized.description = normalized.description or ""
+    normalized.attributes = sorted(set(normalized.attributes) - {"primary_key"})
+    if not compare_types:
+        normalized.type = ""
+    return normalized
+
+
+def _canonical_columns(
+    columns: list[ColumnSpec] | None,
+    *,
+    compare_types: bool,
+) -> list[Any]:
+    column_map = {column.name: column for column in columns or []}
+    canonical = []
+    for name in sorted(column_map):
+        column = column_map[name]
+        normalized = _normalized_column(column, name, column.type, compare_types)
+        if not compare_types:
+            default = _normalized_column(None, name, column.type, compare_types)
+            if normalized == default:
+                continue
+        canonical.append(_canonical_value(normalized))
+    return canonical
+
+
+def _canonical_dimension_links(
+    links: list[DimensionJoinLinkSpec | DimensionReferenceLinkSpec] | None,
+) -> list[Any]:
+    return _sorted_canonical_values(
+        (link._comparison_key() for link in links or []),
+    )
+
+
+def _canonical_cube_columns(columns: list[ColumnSpec] | None) -> dict[str, Any]:
+    return {
+        column.name: _canonical_value(column.partition)
+        for column in columns or []
+        if column.partition
+    }
+
+
+def _semantic_field_value(spec: NodeSpec, field: str) -> Any:
+    value = getattr(spec, field)
+    if field == "query":
+        return (
+            str(spec.query_ast) if spec.query_ast is not None else spec.rendered_query
+        )
+    if field == "columns":
+        if isinstance(spec, CubeSpec):
+            return _canonical_cube_columns(spec.rendered_columns)
+        return _canonical_columns(
+            value,
+            compare_types=isinstance(spec, SourceSpec),
+        )
+    if field == "dimension_links" and isinstance(spec, LinkableNodeSpec):
+        return _canonical_dimension_links(spec.dimension_links)
+
+    canonical = _canonical_value(value)
+    if not isinstance(canonical, list):
+        return canonical
+
+    set_valued = field == "primary_key" or (
+        isinstance(spec, CubeSpec) and field == "filters"
+    )
+    if spec.field_order_change_tier(field) < ChangeTier.MAJOR:
+        return _sorted_canonical_values(canonical, unique=set_valued)
+    return canonical
+
+
+def _semantic_fingerprint_payload(spec: NodeSpec) -> dict[str, Any]:
+    for field, field_info in type(spec).model_fields.items():
+        if field in {"name", "namespace", "node_type"} or field_info.exclude is True:
+            continue
+        if type(spec).field_change_tier(field) == ChangeTier.MAJOR:
+            _canonical_json(_canonical_value(getattr(spec, field)))
+
+    rendered = spec.rendered_spec()
+    fields = {}
+    for field, field_info in type(rendered).model_fields.items():
+        if field in {"name", "namespace", "node_type"}:
+            continue
+        if field_info.exclude is True:
+            continue
+        if type(rendered).field_change_tier(field) != ChangeTier.MAJOR:
+            continue
+        fields[field] = _semantic_field_value(rendered, field)
+    return {
+        "domain": "datajunction/node-semantic",
+        "version": 1,
+        "node_type": _canonical_value(rendered.node_type),
+        "fields": fields,
+    }
 
 
 def _norm(v: Any) -> Any:
@@ -1366,7 +1528,7 @@ def diff(
     """
     return [
         field
-        for field in one.model_fields.keys()
+        for field in one.model_fields
         if field not in (ignore_fields or [])
         and hasattr(one, field)
         and hasattr(two, field)
@@ -1630,6 +1792,8 @@ class DeploymentResult(BaseModel):
     operation: Operation
     message: str = ""
     changed_fields: list[str] = Field(default_factory=list)
+    change_tier: ChangeTierName | None = None
+    semantic_fingerprint: SemanticFingerprint | None = None
 
 
 class DeploymentInfo(BaseModel):
@@ -1675,39 +1839,19 @@ def eq_columns(
     if compare_types and a and b and set(a_map.keys()) != set(b_map.keys()):
         return False
     a_cols, b_cols = [], []
-    for col_name in set(a_map.keys()).union(set(b_map.keys())):
-        a_col = a_map.get(col_name).model_copy() if a_map.get(col_name) else None  # type: ignore
-        b_col = b_map.get(col_name).model_copy() if b_map.get(col_name) else None  # type: ignore
-        if not a_col:
-            a_col = ColumnSpec(
-                name=col_name,
-                display_name=labelize(col_name),
-                type=b_col.type if b_col else "",
-                attributes=[],
-            )
-        if not a_col.display_name:
-            a_col.display_name = labelize(col_name)
-        if not a_col.description:
-            a_col.description = ""
-        if not b_col:
-            b_col = ColumnSpec(  # pragma: no cover
-                name=col_name,
-                display_name=labelize(col_name),
-                type=a_col.type if a_col else "",
-                attributes=[],
-            )
-        if not b_col.display_name:
-            b_col.display_name = labelize(col_name)
-        if not b_col.description:  # pragma: no cover
-            b_col.description = ""
-        if not compare_types:
-            a_col.type = ""
-            b_col.type = ""
-        # Remove primary_key from copies for comparison
-        if "primary_key" in a_col.attributes:
-            a_col.attributes = list(set(a_col.attributes) - {"primary_key"})
-        if "primary_key" in b_col.attributes:
-            b_col.attributes = list(set(b_col.attributes) - {"primary_key"})
+    for col_name in sorted(set(a_map).union(b_map)):
+        a_col = _normalized_column(
+            a_map.get(col_name),
+            col_name,
+            b_map[col_name].type if col_name in b_map else "",
+            compare_types,
+        )
+        b_col = _normalized_column(
+            b_map.get(col_name),
+            col_name,
+            a_map[col_name].type if col_name in a_map else "",
+            compare_types,
+        )
         a_cols.append(a_col)
         b_cols.append(b_col)
     return a_cols == b_cols

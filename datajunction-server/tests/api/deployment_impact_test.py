@@ -39,6 +39,19 @@ async def _wait_for_deployment(client, deployment_id: str, timeout: int = 30):
     return (await client.get(f"/deployments/{deployment_id}")).json()
 
 
+async def _impact_nodes(client, spec):
+    response = await client.post(
+        "/deployments/impact",
+        json=spec.model_dump(by_alias=True),
+    )
+    assert response.status_code == 200
+    return {
+        result["name"]: result
+        for result in response.json()["results"]
+        if result["deploy_type"] == "node"
+    }
+
+
 class TestDeploymentImpactEndpoint:
     """Tests for POST /deployments/impact (orchestrator dry-run)."""
 
@@ -76,6 +89,10 @@ class TestDeploymentImpactEndpoint:
         assert len(node_results) == 1
         assert node_results[0].name == "impact_create_test.orders"
         assert node_results[0].operation == "create"
+        assert node_results[0].change_tier == "major"
+        assert (
+            node_results[0].semantic_fingerprint == spec.nodes[0].semantic_fingerprint()
+        )
 
     @pytest.mark.asyncio
     async def test_impact_detects_updates(self, client_with_roads):
@@ -137,6 +154,20 @@ class TestDeploymentImpactEndpoint:
         assert len(update_results) == 1
         assert "orders_summary" in update_results[0]["name"]
         assert len(skip_results) >= 1
+        assert update_results[0]["change_tier"] == "major"
+        assert (
+            update_results[0]["semantic_fingerprint"]
+            == updated_spec.nodes[0].semantic_fingerprint().model_dump()
+        )
+        assert (
+            update_results[0]["semantic_fingerprint"]
+            != initial_spec.nodes[0].semantic_fingerprint().model_dump()
+        )
+        unchanged_nodes = [
+            result for result in skip_results if result["deploy_type"] == "node"
+        ]
+        assert all(result["change_tier"] == "none" for result in unchanged_nodes)
+        assert all(result["semantic_fingerprint"] for result in unchanged_nodes)
 
     @pytest.mark.asyncio
     async def test_impact_detects_deletions(self, client_with_roads):
@@ -192,6 +223,66 @@ class TestDeploymentImpactEndpoint:
         delete_results = [r for r in data["results"] if r["operation"] == "delete"]
         assert len(delete_results) == 1
         assert "to_delete" in delete_results[0]["name"]
+        assert delete_results[0]["change_tier"] == "major"
+        assert (
+            delete_results[0]["semantic_fingerprint"]
+            == initial_spec.nodes[1].semantic_fingerprint().model_dump()
+        )
+
+    @pytest.mark.asyncio
+    async def test_impact_minor_full_noop_and_forced_revalidation(
+        self,
+        client_with_roads,
+    ):
+        initial = DeploymentSpec(
+            namespace="impact_tiers_test",
+            nodes=[
+                SourceSpec(
+                    name="one",
+                    catalog="default",
+                    schema_="test",
+                    table="one",
+                    description="Before",
+                    columns=[ColumnSpec(name="id", type="int")],
+                ),
+                SourceSpec(
+                    name="two",
+                    catalog="default",
+                    schema_="test",
+                    table="two",
+                    columns=[ColumnSpec(name="id", type="int")],
+                ),
+            ],
+        )
+        deployed = await client_with_roads.post(
+            "/deployments",
+            json=initial.model_dump(by_alias=True),
+        )
+        await _wait_for_deployment(client_with_roads, deployed.json()["uuid"])
+
+        minor = initial.model_copy(deep=True)
+        minor.nodes[0].description = "After"
+        by_name = await _impact_nodes(client_with_roads, minor)
+        assert by_name["impact_tiers_test.one"]["change_tier"] == "minor"
+        assert (
+            by_name["impact_tiers_test.one"]["semantic_fingerprint"]
+            == initial.nodes[0].semantic_fingerprint().model_dump()
+        )
+        assert by_name["impact_tiers_test.two"]["change_tier"] == "none"
+
+        noop_nodes = await _impact_nodes(client_with_roads, initial)
+        assert set(noop_nodes) == {
+            "impact_tiers_test.one",
+            "impact_tiers_test.two",
+        }
+        assert all(result["change_tier"] == "none" for result in noop_nodes.values())
+        assert all(result["semantic_fingerprint"] for result in noop_nodes.values())
+
+        forced = initial.model_copy(update={"force": True})
+        forced_nodes = await _impact_nodes(client_with_roads, forced)
+        assert all(result["operation"] == "update" for result in forced_nodes.values())
+        assert all(result["change_tier"] == "none" for result in forced_nodes.values())
+        assert all(result["semantic_fingerprint"] for result in forced_nodes.values())
 
     @pytest.mark.asyncio
     async def test_dry_run_does_not_mutate_db(self, client_with_roads):
@@ -225,6 +316,31 @@ class TestDeploymentImpactEndpoint:
         if nodes_resp.status_code == 200:
             node_names = [n["name"] for n in nodes_resp.json()]
             assert "dry_run_no_mutation_test.ephemeral" not in node_names
+
+    @pytest.mark.asyncio
+    async def test_invalid_fingerprint_fails_preview(self, client_with_roads):
+        spec = DeploymentSpec(
+            namespace="impact_bad_fingerprint",
+            nodes=[
+                SourceSpec(
+                    name="source",
+                    catalog="default",
+                    schema_="test",
+                    table="source",
+                ),
+            ],
+        )
+        with mock.patch.object(
+            SourceSpec,
+            "semantic_fingerprint",
+            side_effect=ValueError("cannot fingerprint"),
+        ):
+            response = await client_with_roads.post(
+                "/deployments/impact",
+                json=spec.model_dump(by_alias=True),
+            )
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Internal Server Error"}
 
     @pytest.mark.asyncio
     async def test_downstream_impacts_returned_for_invalid_parent(

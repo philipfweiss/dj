@@ -57,6 +57,7 @@ from datajunction_server.models.deployment import (
     MetricSpec,
     PartitionSpec,
     PartitionType,
+    SemanticFingerprint,
     SourceSpec,
     TagSpec,
     TransformSpec,
@@ -1174,6 +1175,11 @@ class TestCubeDeployment:
         assert len(revisions) == 1
         assert len(results) == 1
         assert results[0].status == "invalid"
+        assert results[0].change_tier == "major"
+        assert (
+            results[0].semantic_fingerprint
+            == invalid_results[0].spec.semantic_fingerprint()
+        )
 
     @pytest.mark.asyncio
     async def test_cube_column_partition_applied_from_spec(
@@ -2650,6 +2656,7 @@ async def test_delete_nodes_bulk_deletes_existing_node(
     # "default.hard_hat" is present in the pre-loaded roads example DB.
     spec = Mock()
     spec.rendered_name = "default.hard_hat"
+    spec.semantic_fingerprint.return_value = SemanticFingerprint(digest="a" * 64)
     # No external references block the delete.
     with patch.object(orch, "_validate_node_deletion", AsyncMock(return_value={})):
         results = await orch._delete_nodes([spec])
@@ -2658,6 +2665,8 @@ async def test_delete_nodes_bulk_deletes_existing_node(
     assert results[0].status == DeploymentResult.Status.SUCCESS
     assert results[0].operation == DeploymentResult.Operation.DELETE
     assert results[0].name == "default.hard_hat"
+    assert results[0].change_tier == "major"
+    assert results[0].semantic_fingerprint == spec.semantic_fingerprint.return_value
 
     # The node row is gone.
     gone = (
@@ -2684,8 +2693,10 @@ async def test_delete_nodes_reports_referenced_and_missing(
     )
     referenced = Mock()
     referenced.rendered_name = "default.referenced"
+    referenced.semantic_fingerprint.return_value = SemanticFingerprint(digest="b" * 64)
     absent = Mock()
     absent.rendered_name = "default.does_not_exist"
+    absent.semantic_fingerprint.return_value = SemanticFingerprint(digest="c" * 64)
 
     with patch.object(
         orch,
@@ -2699,6 +2710,8 @@ async def test_delete_nodes_reports_referenced_and_missing(
     assert "referenced by" in by_name["default.referenced"].message
     assert by_name["default.does_not_exist"].status == DeploymentResult.Status.FAILED
     assert "not found" in by_name["default.does_not_exist"].message
+    assert all(result.change_tier == "major" for result in results)
+    assert by_name["default.referenced"].semantic_fingerprint.digest == "b" * 64
 
 
 class TestGenerateChangelog:

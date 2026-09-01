@@ -103,6 +103,7 @@ from datajunction_server.models.deployment import (
     SourceSpec,
     TagSpec,
     bump_version,
+    change_tier_name,
     declared_materialization_blocks,
     eq_or_fallback,
     render_prefixes,
@@ -1587,6 +1588,10 @@ class DeploymentOrchestrator:
                     else DeploymentResult.Status.SKIPPED,
                     operation=DeploymentResult.Operation.NOOP,
                     message="Unchanged, still INVALID" if is_invalid else "Unchanged",
+                    change_tier=change_tier_name(ChangeTier.NONE),
+                    semantic_fingerprint=existing_specs[
+                        node_spec.rendered_name
+                    ].semantic_fingerprint(),
                 ),
             )
 
@@ -3818,6 +3823,10 @@ class DeploymentOrchestrator:
                 + ("\n".join([""] + changelog))
                 + invalid_note,
                 changed_fields=changed_fields,
+                change_tier=change_tier_name(
+                    change_tier if existing else ChangeTier.MAJOR,
+                ),
+                semantic_fingerprint=cube_spec.semantic_fingerprint(),
             )
 
             deployment_results.append(deployment_result)
@@ -4095,6 +4104,7 @@ class DeploymentOrchestrator:
         results = []
         for node_spec in to_delete:
             node_name = node_spec.rendered_name
+            semantic_fingerprint = node_spec.semantic_fingerprint()
             if node_name in references:
                 # Node has references - skip deletion and return FAILED result
                 referencing_nodes = references[node_name]
@@ -4110,6 +4120,8 @@ class DeploymentOrchestrator:
                         status=DeploymentResult.Status.FAILED,
                         operation=DeploymentResult.Operation.DELETE,
                         message=error_msg,
+                        change_tier=change_tier_name(ChangeTier.MAJOR),
+                        semantic_fingerprint=semantic_fingerprint,
                     ),
                 )
             elif node_name in deleted_names:
@@ -4120,6 +4132,8 @@ class DeploymentOrchestrator:
                         status=DeploymentResult.Status.SUCCESS,
                         operation=DeploymentResult.Operation.DELETE,
                         message=f"Node {node_name} has been removed.",
+                        change_tier=change_tier_name(ChangeTier.MAJOR),
+                        semantic_fingerprint=semantic_fingerprint,
                     ),
                 )
             else:
@@ -4131,6 +4145,8 @@ class DeploymentOrchestrator:
                         status=DeploymentResult.Status.FAILED,
                         operation=DeploymentResult.Operation.DELETE,
                         message=f"Node {node_name} not found.",
+                        change_tier=change_tier_name(ChangeTier.MAJOR),
+                        semantic_fingerprint=semantic_fingerprint,
                     ),
                 )
 
@@ -4777,6 +4793,10 @@ class DeploymentOrchestrator:
             + ("\n".join([""] + changelog))
             + invalid_note,
             changed_fields=changed_fields,
+            change_tier=change_tier_name(
+                change_tier if existing else ChangeTier.MAJOR,
+            ),
+            semantic_fingerprint=result.spec.semantic_fingerprint(),
         )
         return deployment_result, new_node, new_revision
 

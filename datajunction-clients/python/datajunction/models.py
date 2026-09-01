@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from datajunction._base import SerializableMixin
 
@@ -362,6 +363,31 @@ class BranchInfo(SerializableMixin):
 
 
 @dataclass
+class SemanticFingerprint:
+    """A versioned semantic node digest returned by the server."""
+
+    digest: str
+    algorithm: str = "sha256"
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.algorithm != "sha256":
+            raise ValueError("Semantic fingerprint algorithm must be sha256")
+        if re.fullmatch(r"[0-9a-f]{64}", self.digest) is None:
+            raise ValueError(
+                "Semantic fingerprint digest must be 64 lowercase hexadecimal characters",
+            )
+
+    @classmethod
+    def from_dict(cls, d: dict) -> SemanticFingerprint:
+        return cls(
+            algorithm=d.get("algorithm", "sha256"),
+            version=d.get("version", 1),
+            digest=d.get("digest", ""),
+        )
+
+
+@dataclass
 class DeploymentResult:
     """A single node-level result within a deployment."""
 
@@ -370,15 +396,22 @@ class DeploymentResult:
     status: str
     message: str = ""
     changed_fields: list[str] = field(default_factory=list)
+    change_tier: Literal["none", "minor", "major"] | None = None
+    semantic_fingerprint: SemanticFingerprint | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> DeploymentResult:
+        fingerprint = d.get("semantic_fingerprint")
         return cls(
             name=d.get("name", ""),
             operation=d.get("operation", ""),
             status=d.get("status", ""),
             message=d.get("message", ""),
             changed_fields=d.get("changed_fields") or [],
+            change_tier=d.get("change_tier"),
+            semantic_fingerprint=(
+                SemanticFingerprint.from_dict(fingerprint) if fingerprint else None
+            ),
         )
 
 

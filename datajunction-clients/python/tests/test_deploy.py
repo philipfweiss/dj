@@ -1,21 +1,22 @@
 import importlib.metadata
 import io
-from pathlib import Path
 import time
 import zipfile
+from pathlib import Path
 from unittest import mock
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+import yaml
 from datajunction.deployment import DeploymentService
 from datajunction.exceptions import DJClientException, DJDeploymentFailure
-from datajunction.models import DeploymentInfo
+from datajunction.models import DeploymentInfo, SemanticFingerprint
 from datajunction.rendering import (
     _render_error_bullets,
     _strip_summary_lines,
     print_deployment_header,
     print_results,
 )
-import yaml
 from rich.console import Console
 
 
@@ -1365,6 +1366,71 @@ class TestGetImpact:
         # Verify the result is returned
         assert result["namespace"] == "test.ns"
         assert result["uuid"] == "dry_run"
+
+    def test_get_impact_returns_raw_fingerprint_response(self, tmp_path, monkeypatch):
+        (tmp_path / "dj.yaml").write_text(yaml.safe_dump({"namespace": "test.ns"}))
+        (tmp_path / "node.yaml").write_text(
+            yaml.safe_dump({"name": "test.ns.my_node", "node_type": "source"}),
+        )
+        monkeypatch.delenv("DJ_DEPLOY_REPO", raising=False)
+
+        response = {
+            "uuid": "dry_run",
+            "namespace": "test.ns",
+            "status": "success",
+            "results": [
+                {
+                    "name": "test.ns.my_node",
+                    "deploy_type": "node",
+                    "operation": "noop",
+                    "status": "skipped",
+                    "message": "Unchanged",
+                    "change_tier": "none",
+                    "semantic_fingerprint": {
+                        "algorithm": "sha256",
+                        "version": 1,
+                        "digest": "a" * 64,
+                    },
+                },
+            ],
+            "downstream_impacts": [],
+        }
+        mock_client = MagicMock()
+        mock_client.get_deployment_impact.return_value = response
+
+        result = DeploymentService(mock_client).get_impact(tmp_path, display=False)
+
+        assert result is response
+        parsed = DeploymentInfo.from_dict(result)
+        assert parsed.results[0].change_tier == "none"
+        assert parsed.results[0].semantic_fingerprint == SemanticFingerprint(
+            digest="a" * 64,
+        )
+
+    def test_deployment_info_parses_older_impact_response(self):
+        parsed = DeploymentInfo.from_dict(
+            {
+                "uuid": "dry_run",
+                "namespace": "test.ns",
+                "status": "success",
+                "results": [
+                    {
+                        "name": "test.ns.my_node",
+                        "operation": "noop",
+                        "status": "skipped",
+                    },
+                ],
+            },
+        )
+        assert parsed.results[0].change_tier is None
+        assert parsed.results[0].semantic_fingerprint is None
+
+    @pytest.mark.parametrize("digest", ["a" * 63, "A" * 64, "g" * 64])
+    def test_semantic_fingerprint_rejects_invalid_digest(self, digest):
+        with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+            SemanticFingerprint(digest=digest)
+        with pytest.raises(ValueError, match="algorithm must be sha256"):
+            SemanticFingerprint(digest="a" * 64, algorithm="md5")
 
     def test_get_impact_with_namespace_override(self, tmp_path, monkeypatch):
         """get_impact should respect namespace override."""
